@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from config import DeviceConfig
 
@@ -18,6 +19,33 @@ class Curve:
 
     def curvature(self, y):
         return np.abs(self.d2f(y)) / (1.0 + self.df(y) ** 2) ** 1.5
+
+    def signed_distance(self, X, Y, Ly, samples=1001):
+        """Approximate closest-point distance to the interface, positive on the n side.
+
+        Find the nearest sampled point, then minimize squared distance in the
+        two adjacent sample intervals by vectorized golden-section search.
+        The sampling should resolve each bend in the interface.
+        """
+        if self.name == "planar":
+            return X - self.f(Y)
+        y = np.linspace(0.0, Ly, samples)
+        tree = cKDTree(np.column_stack((self.f(y), y)))
+        _, i = tree.query(np.column_stack((X.ravel(), Y.ravel())))
+        i = i.reshape(X.shape)
+        lo = y[np.maximum(i - 1, 0)]
+        hi = y[np.minimum(i + 1, samples - 1)]
+        ratio = (np.sqrt(5.0) - 1.0) / 2.0
+
+        def distance_sq(t):
+            return (X - self.f(t)) ** 2 + (Y - t) ** 2
+
+        for _ in range(28):
+            left = hi - ratio * (hi - lo)
+            right = lo + ratio * (hi - lo)
+            keep_left = distance_sq(left) < distance_sq(right)
+            lo, hi = np.where(keep_left, lo, left), np.where(keep_left, right, hi)
+        return np.sign(X - self.f(Y)) * np.sqrt(distance_sq((lo + hi) / 2.0))
 
 
 def planar(x0: float) -> Curve:
@@ -56,8 +84,11 @@ def circular_arc(xc: float, yc: float, R: float) -> Curve:
                  lambda y: R**2 / s(y) ** 3)
 
 
-def min_transition_width(cfg: DeviceConfig, curve: Curve, n_sample: int = 2001) -> float:
+def min_transition_width(cfg: DeviceConfig, curve: Curve, n_sample: int = 2001,
+                         profile: str = "horizontal") -> float:
     """Smallest admissible tanh scale w: 2.5*max(dx,dy)*sqrt(1 + max f'^2)."""
+    if profile == "signed_distance":
+        return 2.5 * max(cfg.dx, cfg.dy)
     y = np.linspace(0.0, cfg.Ly, n_sample)
     slope = np.max(np.abs(curve.df(y)))
     return 2.5 * max(cfg.dx, cfg.dy) * np.sqrt(1.0 + slope**2)
@@ -71,6 +102,12 @@ def check_walls(cfg: DeviceConfig, curve: Curve, tol: float = 0.05) -> None:
                           "meets a zero-flux wall at an angle (mirror-symmetry kink).")
 
 
-def net_doping(cfg: DeviceConfig, X, Y, curve: Curve, w: float):
-    """N_net = (ND-NA)/2 + (ND+NA)/2 * tanh((x - f(y))/w)   [cm^-3]."""
-    return 0.5 * (cfg.ND - cfg.NA) + 0.5 * (cfg.ND + cfg.NA) * np.tanh((X - curve.f(Y)) / w)
+def net_doping(cfg: DeviceConfig, X, Y, curve: Curve, w: float, profile="horizontal"):
+    """Net ionized doping [cm^-3] from a horizontal or normal transition."""
+    if profile == "horizontal":
+        distance = X - curve.f(Y)
+    elif profile == "signed_distance":
+        distance = curve.signed_distance(X, Y, cfg.Ly)
+    else:
+        raise ValueError(f"Unknown doping profile: {profile}")
+    return 0.5 * (cfg.ND - cfg.NA) + 0.5 * (cfg.ND + cfg.NA) * np.tanh(distance / w)

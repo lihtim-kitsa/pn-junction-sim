@@ -22,19 +22,22 @@ class ConvergenceError(RuntimeError):
 # --- Device: geometry + doping + boundary values in scaled form -------------------
 class Device:
     def __init__(self, cfg: DeviceConfig = DeviceConfig(), curve: Optional[Curve] = None,
-                 w: Optional[float] = None, check: bool = True):
+                 w: Optional[float] = None, check: bool = True, profile: str = "horizontal"):
         self.cfg = cfg
         self.sc = sc = Scaling(cfg)
         self.mesh = mesh = Mesh(cfg, sc)
         self.curve = curve if curve is not None else planar(cfg.Lx / 2)
-        w_min = min_transition_width(cfg, self.curve)
+        self.profile = profile
+        w_min = min_transition_width(cfg, self.curve, profile=profile)
         self.w = w if w is not None else w_min
+        if not np.isfinite(self.w) or self.w <= 0:
+            raise ValueError("The doping transition scale w must be finite and positive")
         if check:
             if self.w < w_min * (1 - 1e-9):
                 raise ValueError(f"w = {self.w * 1e4:.4f} um < required "
-                                 f"{w_min * 1e4:.4f} um (2.5*max(dx,dy)*sqrt(1+max f'^2))")
+                                 f"{w_min * 1e4:.4f} um for the {profile} profile")
             check_walls(cfg, self.curve)
-        self.Nnet_phys = net_doping(cfg, mesh.X, mesh.Y, self.curve, self.w)
+        self.Nnet_phys = net_doping(cfg, mesh.X, mesh.Y, self.curve, self.w, profile)
         self.N = sc.scale("N", self.Nnet_phys).ravel()
         self.ni = sc.scale("ni", cfg.ni)
         self.mu_n = cfg.mu_n / sc.mu0

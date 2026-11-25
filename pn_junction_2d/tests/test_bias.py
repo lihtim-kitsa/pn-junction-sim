@@ -3,7 +3,7 @@ import pytest
 
 from config import DeviceConfig, SolverConfig
 from geometry import cosine
-from postprocess import current_conservation_error, ideality_factor, terminal_current
+from postprocess import bias_diagnostics, current_conservation_error, ideality_factor, terminal_current
 from solver import Device, run_voltage_sweep, solve_bias, solve_equilibrium
 
 
@@ -20,6 +20,21 @@ def test_zero_bias_current(planar_sweep):
     I0 = terminal_current(dev, states[0.0])
     I_fwd = terminal_current(dev, states[0.3])
     assert abs(I0) < 1e-6 * abs(I_fwd)
+    report = bias_diagnostics(dev, states[0.0])
+    assert np.isnan(report["relative_current_deviation"])
+    assert report["max_current_deviation_A_per_cm"] < 1e-20
+
+
+def test_bias_diagnostics_match_face_currents(planar_sweep):
+    dev, states = planar_sweep
+    report = bias_diagnostics(dev, states[-1.0])
+    np.testing.assert_allclose(
+        [report["left_current_A_per_cm"], report["right_current_A_per_cm"]],
+        terminal_current(dev, states[-1.0]), rtol=1e-3, atol=0,
+    )
+    assert report["poisson_residual_scaled"] < 1e-8
+    assert report["electron_continuity_residual_cm-3_s-1"] < 1e6
+    assert report["hole_continuity_residual_cm-3_s-1"] < 1e6
 
 
 def test_current_conservation(planar_sweep):

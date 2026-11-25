@@ -2,8 +2,10 @@ import numpy as np
 import pytest
 
 from config import DeviceConfig, UM
+from geometry import net_doping
 from postprocess import (abrupt_depletion_width, abrupt_peak_field, built_in_potential,
-                         depletion_width, electric_field, space_charge)
+                         depletion_width, electric_field, space_charge,
+                         symmetric_equilibrium_peak_field)
 from solver import Device, solve_equilibrium, solve_equilibrium_1d
 
 
@@ -67,7 +69,7 @@ def test_field_and_width_vs_abrupt(eq):
 def test_w_convergence_1d():
     """As w -> 0 (resolved), the 1D peak field approaches the abrupt formula (O(w))."""
     cfg = DeviceConfig(Nx=8001)
-    Eab = abrupt_peak_field(cfg)
+    Eab = symmetric_equilibrium_peak_field(cfg)
     ws = np.array([0.08, 0.04, 0.02, 0.01]) * UM
     Es = []
     for w in ws:
@@ -78,3 +80,24 @@ def test_w_convergence_1d():
     assert np.all(np.diff(errs) < 0)
     E_extrap = 2 * Es[-1] - Es[-2]          # Richardson, first-order in w
     assert abs(E_extrap / Eab - 1) < 0.01
+
+
+def test_asymmetric_junction_contacts_and_doping_zero():
+    cfg = DeviceConfig(NA=4e16, ND=1e16, Nx=101, Ny=21)
+    dev = Device(cfg)
+    st = solve_equilibrium(dev)
+    expected = cfg.VT * np.log(cfg.NA * cfg.ND / cfg.ni**2)
+    vbi = cfg.VT * (st.psi[dev.mesh.right][0] - st.psi[dev.mesh.left][0])
+    assert vbi == pytest.approx(expected, rel=1e-9)
+    assert dev.sc.C0 * (dev.pL - dev.nL) == pytest.approx(cfg.NA)
+    assert dev.sc.C0 * (dev.nR - dev.pR) == pytest.approx(cfg.ND)
+    x_zero = cfg.Lx / 2 + 0.5 * dev.w * np.log(cfg.NA / cfg.ND)
+    assert net_doping(cfg, x_zero, 0.0, dev.curve, dev.w) == pytest.approx(0, abs=100)
+    with pytest.raises(ValueError, match="symmetric"):
+        symmetric_equilibrium_peak_field(cfg)
+
+
+def test_abrupt_width_rejects_zero_or_negative_barrier():
+    cfg = DeviceConfig()
+    with pytest.raises(ValueError, match="V < V_bi"):
+        abrupt_depletion_width(cfg, built_in_potential(cfg))

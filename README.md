@@ -6,6 +6,36 @@ date: 2026-11-24
 
 # 2D Curved PN Junction: Mathematical Formulation & Numerical Solver
 
+## Quick start
+
+From the repository root, use Python 3.12 or later.
+
+~~~sh
+python -m pip install -r pn_junction_2d/requirements.txt
+python -m pytest -q pn_junction_2d/tests
+python pn_junction_2d/main.py
+~~~
+
+Use `--iv` for the planar sweep or `--curvature` for the cosine comparison.
+The full run includes refinement to a \(401\times161\) grid and may take
+several minutes. Open the notebook in `pn_junction_2d/` with the kernel working
+directory set to that folder. It imports the same solver and study functions.
+Use [task_fixed.md](task_fixed.md) for the current implementation plan. The
+files in `archives/` preserve earlier drafts.
+
+| Output in `pn_junction_2d/figures/` | Contents |
+| --- | --- |
+| `iv_planar.png` and `dashboard_planar_*.png` | Forward and reverse current branches, plus field and carrier plots |
+| `srh_generation_reverse.png` | Positive net SRH generation at −3 V |
+| `iv_diagnostics.csv` | Bias, contact and mean currents, absolute and relative current variation, three equation residuals, peak field and location, and solver status |
+| `emax_vs_curvature.png` and `curvature_diagnostics.csv` | Both doping profiles at each amplitude and refined-grid endpoint checks |
+| `curvature_field_comparison.png` and `curvature_normal_profiles.png` | Shared-scale field maps and peak field along normals versus junction arc length |
+
+Both contact currents are signed in the \(+x\) direction and reported per
+unit out-of-plane depth. At or below \(10^{-20}\) A/cm, the relative deviation
+is undefined and the absolute deviation remains available. The continuity
+residuals are in cm\(^{-3}\) s\(^{-1}\).
+
 This document details the complete physical model, mathematical derivations, and numerical architecture for simulating a 2D Silicon PN junction with a variable junction curve $x = f(y)$ under applied bias. The solver uses the **Finite Volume Method (FVM)** on a structured Cartesian grid, **Scharfetter-Gummel** flux discretization, and **Gummel's decoupled iteration**.
 
 ---
@@ -40,7 +70,7 @@ All physical equations use standard semiconductor $\text{cm}$-based units. The d
 | $\Delta x, \; \Delta y$ | Uniform grid spacing in $x$ and $y$ | $\text{cm}$ |
 | $\Omega_{i,j}, \; \partial\Omega_{i,j}$ | Control volume cell around $(i,j)$ and its boundary | Area $\Delta x \Delta y$ |
 | $x = f(y)$ | Junction interface curve | User-defined (planar, sinusoidal, parabolic, etc.) |
-| $w$ | Transition width of the $\tanh$ doping profile | $\text{cm}$ (must satisfy $w \ge 2.5 \Delta x$) |
+| $w$ | Scale parameter of the $\tanh$ doping profile | $\text{cm}$ (see the grid resolution rule below) |
 | $N_A, \; N_D$ | Acceptor (p-type) and donor (n-type) doping | $\text{cm}^{-3}$ (e.g., $10^{16}\text{ cm}^{-3}$) |
 | $N_{\text{net}}(x,y)$ | Net ionized doping concentration ($N_D - N_A$) | $\text{cm}^{-3}$ |
 
@@ -122,6 +152,13 @@ For any graph $x=f(y)$, the local curvature is
 $$\kappa(y)=\frac{|f''(y)|}{\left[1+(f'(y))^2\right]^{3/2}},\qquad R_c(y)=\frac{1}{\kappa(y)}.$$
 
 **Grid resolution rule:** Because the tanh argument is measured along $x$, the transition width normal to the junction is $w/\sqrt{1+f'^2}$. Choose $w \ge 2.5\max(\Delta x,\Delta y)\sqrt{1+\max f'^2}$ and also require $w \ll W_d$ for the benchmark of interest. Here $w$ is the tanh scale parameter, not the full physical transition width. The solver should report $w/\Delta x$ and the resulting transition width when validating grid resolution.
+
+The signed-distance profile replaces $x-f(y)$ by the closest-point distance
+to the curve, signed positive on the n side. It holds the transition scale
+fixed along the local normal and uses the grid floor
+$w\ge 2.5\max(\Delta x,\Delta y)$. For unequal doping, $f(y)$ denotes the
+midpoint of the grading between $-N_A$ and $N_D$. The zero of $N_{\rm net}$
+is at the signed coordinate $(w/2)\ln(N_A/N_D)$ in either profile.
 
 ---
 
@@ -248,6 +285,20 @@ Once converged at a target bias, rescale all arrays back to physical units:
   $$I = \sum_{j} w_j \left( J_{n, x, i+1/2, j} + J_{p, x, i+1/2, j} \right) \qquad [\text{A/cm}]$$
 
 ### Recommended Verification & Study Benchmarks
-1. **1D Planar Benchmark ($A = 0$):** Verify built-in potential $\psi_{bi}=V_T\ln(N_A N_D/n_i^2)$ and compare peak field $E_{\max}$ and depletion width $W_d$ with the analytical abrupt-junction formulas, using the Debye-tail-corrected voltage $V_{bi}-V-2V_T$. Because the numerical junction uses a tanh profile, perform a small $w$-convergence study before treating the abrupt result as the limiting benchmark.
+1. **1D Planar Benchmark ($A = 0$).** Neutral Boltzmann contacts give
+   $V_{bi}=V_T[\operatorname{asinh}(N_A/2n_i)+\operatorname{asinh}(N_D/2n_i)]$,
+   approximately $V_T\ln(N_AN_D/n_i^2)$ for $N_A,N_D\gg n_i$.
+   For $V<V_{bi}$, the classical abrupt approximation gives
+   $W_d^2=(2\varepsilon/q)(N_A^{-1}+N_D^{-1})(V_{bi}-V)$ and
+   $E_{\max}=2(V_{bi}-V)/W_d$. The simulated half-density width uses the
+   $n=N_D/2$ and $p=N_A/2$ crossings. The Poisson–Boltzmann first integral
+   gives a separate peak-field reference for symmetric abrupt doping at
+   equilibrium. For $N_A=N_D\gg n_i$, this corresponds to subtracting
+   $2V_T$ from the full barrier. The tests approach that limit by reducing
+   $w$ at fine resolution.
 2. **Current Conservation Check:** Confirm $I(x)$ is constant across all columns $i$ to within $0.1\%$ after nonlinear convergence. FVM provides exact cancellation of shared internal face fluxes; the reported tolerance reflects solver and boundary residuals.
-3. **Curvature / Field-Crowding Study:** Use a fixed cosine wavelength, preferably $\lambda=L_y$, and sweep amplitude $A$. For $f(y)=x_0+A\cos(2\pi y/\lambda)$, compute local curvature $\kappa(y)=|f''(y)|/[1+(f'(y))^2]^{3/2}$ and report $\kappa_{\max}=1/R_{c,\min}=A(2\pi/\lambda)^2$. Plot $|\mathbf E|_{\max}$ against $\kappa_{\max}$, and separately inspect whether the field maximum occurs near the high-curvature tip.
+3. **Curvature study.** Hold $\lambda=L_y$, $w=0.11\,\mu\mathrm{m}$ and
+   $V=-2$ V fixed across both profiles. Varying $A$ changes slope as well
+   as $\kappa_{\max}=A(2\pi/\lambda)^2$. Compare the planar and largest
+   amplitudes on the refined grid at the same physical $w$. Use the field
+   map to check where the field maximum lies relative to the curvature extrema.

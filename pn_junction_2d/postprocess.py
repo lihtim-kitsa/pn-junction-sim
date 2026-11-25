@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 
 from config import Q
 from numerics import bernoulli
-from solver import Device, State
+from solver import (Device, State, assemble_electron_matrix, assemble_hole_matrix,
+                    compute_srh, poisson_residual)
 
 
 # --- Fields and currents ----------------------------------------------------------
@@ -53,9 +54,43 @@ def terminal_current(dev: Device, st: State) -> float:
     return float(np.mean(column_currents(dev, st)))
 
 
-def current_conservation_error(dev: Device, st: State) -> float:
+def current_conservation_error(dev: Device, st: State, floor=1e-20) -> float:
+    """Relative variation about the mean, undefined below the current floor."""
     I = column_currents(dev, st)
-    return float(np.max(np.abs(I - I.mean())) / max(abs(I.mean()), 1e-300))
+    mean = I.mean()
+    return float(np.max(np.abs(I - mean)) / abs(mean)) if abs(mean) > floor else np.nan
+
+
+def bias_diagnostics(dev: Device, st: State, enable_srh=True):
+    """Export contact currents, local equation residuals, and the peak field."""
+    I = column_currents(dev, st)
+    mean = I.mean()
+    spread = np.max(np.abs(I - mean))
+    mask = dev.mesh.interior
+    R = compute_srh(dev, st.n, st.p) if enable_srh else 0.0
+    # Use the same zero-flux reference subtraction as current post-processing.
+    n = st.n if st.dn is None else st.dn
+    p = st.p if st.dp is None else st.dp
+    rn = assemble_electron_matrix(dev, st.psi) @ n + R
+    rp = assemble_hole_matrix(dev, st.psi) @ p + R
+    xc, yc, _, _, field = electric_field(dev, st)
+    j, i = np.unravel_index(field.argmax(), field.shape)
+    return {
+        "bias_V": st.V,
+        "left_current_A_per_cm": I[0],
+        "right_current_A_per_cm": I[-1],
+        "mean_current_A_per_cm": mean,
+        "max_current_deviation_A_per_cm": spread,
+        "relative_current_deviation": spread / abs(mean) if abs(mean) > 1e-20 else np.nan,
+        "poisson_residual_scaled": np.max(np.abs(poisson_residual(dev, st.psi, st.n, st.p, st.V))),
+        "electron_continuity_residual_cm-3_s-1": dev.sc.R0 * np.max(np.abs(rn[mask])),
+        "hole_continuity_residual_cm-3_s-1": dev.sc.R0 * np.max(np.abs(rp[mask])),
+        "peak_field_V_per_cm": field[j, i],
+        "peak_x_um": xc[i] * 1e4,
+        "peak_y_um": yc[j] * 1e4,
+        "gummel_iterations": st.iterations,
+        "roundoff_limited": st.roundoff_limited,
+    }
 
 
 def space_charge(dev: Device, st: State):
@@ -74,26 +109,49 @@ def depletion_width(dev: Device, st: State, row: int = None):
     _, n, p = physical(dev, st)
     x = dev.mesh.x
     n, p = n[row], p[row]
-    i_n = np.argmax(n >= dev.cfg.ND / 2)             # first index with n >= ND/2
-    xn = np.interp(dev.cfg.ND / 2, n[i_n - 1:i_n + 1], x[i_n - 1:i_n + 1])
-    i_p = np.where(p >= dev.cfg.NA / 2)[0][-1]       # last index with p >= NA/2
-    xp = np.interp(dev.cfg.NA / 2, p[i_p:i_p + 2][::-1], x[i_p:i_p + 2][::-1])
-    return xn - xp
+    n_half, p_half = dev.cfg.ND / 2, dev.cfg.NA / 2
+    n_edges = np.flatnonzero((n[:-1] < n_half) & (n[1:] >= n_half))
+    p_edges = np.flatnonzero((p[:-1] >= p_half) & (p[1:] < p_half))
+    if not (len(n_edges) and len(p_edges)):
+        return np.nan  # No pair of threshold crossings in the device.
+    i_n, i_p = n_edges[0], p_edges[-1]
+    xn = np.interp(n_half, n[i_n:i_n + 2], x[i_n:i_n + 2])
+    xp = np.interp(p_half, p[i_p:i_p + 2][::-1], x[i_p:i_p + 2][::-1])
+    return xn - xp if xn >= xp else np.nan
 
 
 # --- Analytical abrupt-junction references --------------------------------------------
 def built_in_potential(cfg) -> float:
-    return cfg.VT * np.log(cfg.NA * cfg.ND / cfg.ni**2)
+    """Contact potential difference from Boltzmann statistics and charge neutrality."""
+    return cfg.VT * (np.arcsinh(cfg.NA / (2 * cfg.ni)) + np.arcsinh(cfg.ND / (2 * cfg.ni)))
 
 
-def abrupt_depletion_width(cfg, V: float = 0.0, tail_correction: bool = True) -> float:
-    Veff = built_in_potential(cfg) - V - (2 * cfg.VT if tail_correction else 0.0)
-    return np.sqrt(2 * cfg.eps * Veff / Q * (cfg.NA + cfg.ND) / (cfg.NA * cfg.ND))
+def abrupt_depletion_width(cfg, V: float = 0.0) -> float:
+    """Classical abrupt depletion width [cm] for a positive junction barrier."""
+    barrier = built_in_potential(cfg) - V
+    if not np.isfinite(barrier) or barrier <= 0:
+        raise ValueError("Abrupt depletion approximation requires V < V_bi")
+    return np.sqrt(2 * cfg.eps * barrier / Q * (1 / cfg.NA + 1 / cfg.ND))
 
 
-def abrupt_peak_field(cfg, V: float = 0.0, tail_correction: bool = True) -> float:
-    Veff = built_in_potential(cfg) - V - (2 * cfg.VT if tail_correction else 0.0)
-    return 2 * Veff / abrupt_depletion_width(cfg, V, tail_correction)
+def abrupt_peak_field(cfg, V: float = 0.0) -> float:
+    """Classical abrupt depletion peak field [V/cm]."""
+    return 2 * (built_in_potential(cfg) - V) / abrupt_depletion_width(cfg, V)
+
+
+def symmetric_equilibrium_peak_field(cfg) -> float:
+    """Abrupt Poisson–Boltzmann peak field [V/cm] for symmetric doping.
+
+    The first integral on either side includes the change in mobile charge.
+    For N >> ni this is the familiar 2 V_T correction to the full barrier.
+    """
+    if cfg.NA != cfg.ND or cfg.NA <= 0:
+        raise ValueError("Equilibrium field reference requires symmetric positive doping")
+    u = cfg.NA / (2 * cfg.ni)
+    # hypot(1, u) - 1 written without subtractive cancellation near u = 0.
+    mobile = 2 * cfg.ni * u * (u / (np.hypot(1, u) + 1))
+    integral = cfg.NA * built_in_potential(cfg) / 2 - cfg.VT * mobile
+    return np.sqrt(2 * Q * integral / cfg.eps)
 
 
 def ideality_factor(V, I, VT, vmin=0.25, vmax=0.55):
@@ -165,7 +223,13 @@ def plot_dashboard(dev: Device, st: State, title: str = None, fname: str = None)
 def plot_iv(V, I, VT=None, fname: str = None):
     V, I = np.asarray(V), np.asarray(I)
     fig, ax = plt.subplots(figsize=(6.5, 4.5), constrained_layout=True)
-    ax.semilogy(V, np.abs(I), "o-", ms=4)
+    for mask, label in ((V < 0, "Reverse"), (V > 0, "Forward")):
+        ax.semilogy(V[mask], np.abs(I[mask]), "o-", ms=4, label=label)
+    if np.any(V == 0):
+        i0 = np.abs(I[V == 0][0])
+        ax.text(0.03, 0.97, f"Equilibrium |I| = {i0:.2e} A/cm",
+                transform=ax.transAxes, va="top")
+    ax.legend(loc="lower right")
     ax.set_xlabel(r"$V_{app}$ [V]"); ax.set_ylabel(r"$|I|$ [A/cm]")
     ax.grid(True, which="both", alpha=0.3)
     if VT is not None and np.sum(V > 0.3) >= 3:
@@ -173,4 +237,19 @@ def plot_iv(V, I, VT=None, fname: str = None):
         ax.set_title(f"I-V (fitted ideality n = {nid:.3f}, 0.25-0.55 V)")
     if fname:
         fig.savefig(fname, dpi=130)
+    return fig
+
+
+def plot_srh_generation(dev: Device, st: State, fname=None):
+    """Plot log10 of positive net SRH generation in reverse bias."""
+    mesh = dev.mesh
+    generation = dev.reshape(-dev.sc.R0 * compute_srh(dev, st.n, st.p))
+    values = np.ma.log10(np.ma.masked_less_equal(generation, 0))
+    fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+    im = ax.pcolormesh(mesh.x * 1e4, mesh.y * 1e4, values, shading="auto")
+    ax.set(xlabel="x [µm]", ylabel="y [µm]", aspect="equal",
+           title=f"Net SRH generation at {st.V:+g} V")
+    fig.colorbar(im, ax=ax, label=r"$\log_{10}(-R_{\mathrm{SRH}}/[\mathrm{cm}^{-3}\,\mathrm{s}^{-1}])$")
+    if fname:
+        fig.savefig(fname, dpi=150)
     return fig
